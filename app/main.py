@@ -2,20 +2,25 @@
 
 Endpoints
 ---------
-``POST /archive``            submit (or atomically replace) one period's batch
-``GET  /archive/{period}``   batch metadata
-``POST /census/query``       minimal-read expression + union population
+``POST /archive``                 submit (or atomically replace) one period's batch
+``GET  /archive/{period}``        batch metadata (including the current batch id)
+``POST /archive/{period}/correct`` apply a same-level cell-id permutation
+``POST /census/query``            minimal-read expression + union population
 
 The census endpoint works in two clearly separated phases inside one SQLite
 read snapshot: first derive the expression from the period's catalog only, then
 read headcounts for exactly the cells that appear in the expression.
+
+Corrections are optimistic: the caller submits the batch id it has seen.  A
+fresh batch id is minted only when the correction commits, and the old batch
+keeps serving reads when anything fails.
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -23,16 +28,100 @@ from pydantic import BaseModel, Field, field_validator
 
 from .archive import (
     Archive,
+    BatchChanged,
     BatchConflict,
     InvalidBatch,
     MissingCells,
     UnknownPeriod,
     validate_cell,
 )
+from .correction import (
+    CorrectionProblem,
+    InvalidCorrection,
+    cycle_permutation,
+    validate_permutation,
+)
 from .solver import MAX_DEPTH, analyze
 
 MAX_CELLS_PER_REQUEST = 100_000
 DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "archive.sqlite3"
+
+_SEEN_BATCH_KEYS = (
+    "seen_batch_id",
+    "seen_batch",
+    "seenBatchId",
+    "batch_id",
+    "batchId",
+    "expected_batch_id",
+    "expected_batch",
+    "base_batch_id",
+    "source_batch_id",
+    "seen_batch_no",
+    "batch_no",
+    "batch_version",
+    "batch",
+    "version",
+    "revision",
+    "current_batch_id",
+    "seen",
+)
+_PERIOD_KEYS = ("period", "statistical_period", "period_id", "periodId")
+_PERMUTATION_KEYS = (
+    "permutation",
+    "mapping",
+    "map",
+    "cell_mapping",
+    "cell_map",
+    "cell_permutation",
+    "permute",
+    "correction",
+    "corrections",
+    "cell_correction",
+    "cell_corrections",
+    "cell_changes",
+    "changes",
+    "replacements",
+)
+_POSITION_KEYS = (
+    "cells",
+    "cell_ids",
+    "cell_codes",
+    "grid_cells",
+    "positions",
+    "ids",
+    "cell_list",
+    "order",
+)
+_SWAP_KEYS = (
+    "swaps",
+    "swap",
+    "exchange",
+    "exchanges",
+    "transpositions",
+    "pairs",
+    "moves",
+    "movements",
+)
+_METADATA_KEYS = set(_SEEN_BATCH_KEYS) | set(_PERIOD_KEYS) | set(_PERMUTATION_KEYS) | set(
+    _POSITION_KEYS
+) | set(_SWAP_KEYS) | {
+    "replace",
+    "reason",
+    "note",
+    "comment",
+    "from_cells",
+    "to_cells",
+    "old_cells",
+    "new_cells",
+    "source_cells",
+    "target_cells",
+    "from_cell",
+    "to_cell",
+    "old_cell",
+    "new_cell",
+    "source_cell",
+    "target_cell",
+}
 
 
 def default_database_path() -> str:
@@ -91,6 +180,7 @@ class BatchResponse(BaseModel):
     total_population: int
     created_at: str
     replaced: bool
+    batch_id: str
 
 
 class QueryRequest(BaseModel):
@@ -122,6 +212,42 @@ class MissingArchiveResponse(BaseModel):
     period: str
     missing_blocks: List[str]
     truncated: bool = False
+
+
+class CorrectionMove(BaseModel):
+    source: str
+    target: str
+    population: int
+
+
+class CorrectionRecompute(BaseModel):
+    cell: str
+    previous_population: int
+    population: int
+
+
+class CorrectionResponse(BaseModel):
+    period: str
+    batch_id: str
+    previous_batch_id: str
+    seen_batch_id: str
+    created_at: str
+    cell_count: int
+    total_population: int
+    permutation: Dict[str, str]
+    moves: List[CorrectionMove]
+    recomputed: List[CorrectionRecompute]
+
+
+class CorrectionFailureResponse(BaseModel):
+    detail: str
+    period: str
+    seen_batch_id: Optional[str] = None
+    current_batch_id: Optional[str] = None
+    upper_cells: List[str] = Field(default_factory=list)
+    missing_cells: List[str] = Field(default_factory=list)
+    negative_cells: List[str] = Field(default_factory=list)
+    missing_regions: List[str] = Field(default_factory=list)
 
 
 app = FastAPI(
@@ -184,6 +310,7 @@ def submit_batch(
         total_population=info.total_population,
         created_at=info.created_at,
         replaced=submission.replace,
+        batch_id=info.batch_id,
     )
 
 
@@ -196,7 +323,350 @@ def read_batch(period: str, archive: Archive = Depends(get_archive)) -> BatchRes
         total_population=info.total_population,
         created_at=info.created_at,
         replaced=False,
+        batch_id=info.batch_id,
     )
+
+
+def _first(body: Mapping[str, Any], keys: Sequence[str]) -> Any:
+    for key in keys:
+        if key in body and body[key] is not None:
+            return body[key]
+    return None
+
+
+def _as_pairs(value: Any, *, name: str) -> List[Tuple[str, str]]:
+    """Normalise ``[[old, new], ...]`` or ``{"old": "new"}`` to pairs."""
+    if isinstance(value, Mapping):
+        pairs = [(str(old), str(new)) for old, new in value.items()]
+    elif isinstance(value, (list, tuple)):
+        pairs = []
+        for item in value:
+            if isinstance(item, Mapping):
+                old = _first(item, ("source", "from", "old", "old_cell", "cell"))
+                new = _first(item, ("target", "to", "new", "new_cell", "replacement"))
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                old, new = item
+            else:
+                raise InvalidCorrection(
+                    f"{name} entries must be old/new cell pairs"
+                )
+            if old is None or new is None:
+                raise InvalidCorrection(
+                    f"{name} entries must be old/new cell pairs"
+                )
+            pairs.append((str(old), str(new)))
+    else:
+        raise InvalidCorrection(f"{name} must be a mapping or a list of pairs")
+
+    seen = set()
+    for source, _ in pairs:
+        if source in seen:
+            raise InvalidCorrection(f"duplicate cell id {source!r} in {name}")
+        seen.add(source)
+    return pairs
+
+
+def _correction_permutation(body: Mapping[str, Any]) -> Dict[str, str]:
+    """Read a permutation from any of the supported request shapes.
+
+    Accepted forms (all name 2-8 same-level ids):
+
+    * ``"permutation": {"01": "02", "02": "01"}`` -- explicit one-to-one map
+    * ``"permutation": [["01", "02"], ["02", "01"]]`` -- same, as pairs
+    * ``"swaps": [["01", "02"], ["03", "00"]]`` -- independent swaps
+    * ``"cells": ["01", "02", "03"]`` -- cyclic rotation in the given order
+    * ``"from_cells"``/``"to_cells"`` or ``"old_cells"``/``"new_cells"``
+    """
+    explicit = _first(body, _PERMUTATION_KEYS)
+    if explicit is not None:
+        return dict(_as_pairs(explicit, name="permutation"))
+
+    swaps = _first(body, _SWAP_KEYS)
+    if swaps is not None:
+        # Each swap names two cells that exchange places, so it contributes
+        # both directions; explicit permutations remain directional.
+        pairs = _as_pairs(swaps, name="swaps")
+        result: Dict[str, str] = {}
+        for old, new in pairs:
+            for source, target in ((old, new), (new, old)):
+                if source in result and result[source] != target:
+                    raise InvalidCorrection(
+                        f"cell {source!r} appears in more than one swap"
+                    )
+                result[source] = target
+        return result
+
+    old_cells = _first(body, ("from_cells", "old_cells", "source_cells"))
+    new_cells = _first(body, ("to_cells", "new_cells", "target_cells"))
+    if old_cells is not None or new_cells is not None:
+        if (
+            not isinstance(old_cells, (list, tuple))
+            or not isinstance(new_cells, (list, tuple))
+            or len(old_cells) != len(new_cells)
+        ):
+            raise InvalidCorrection(
+                "from_cells and to_cells must be equal-length lists"
+            )
+        return {str(old): str(new) for old, new in zip(old_cells, new_cells)}
+
+    cells = _first(body, _POSITION_KEYS)
+    if cells is not None:
+        if isinstance(cells, Mapping):
+            return dict(_as_pairs(cells, name="cells"))
+        if not isinstance(cells, (list, tuple)):
+            raise InvalidCorrection("cells must be a list of cell ids")
+        if all(isinstance(item, Mapping) for item in cells):
+            return dict(_as_pairs(cells, name="cells"))
+        if not all(isinstance(cell, str) for cell in cells):
+            raise InvalidCorrection("cells must be a list of cell ids")
+        return cycle_permutation(list(cells))
+
+    old_cell = _first(body, ("from_cell", "old_cell", "source_cell"))
+    new_cell = _first(body, ("to_cell", "new_cell", "target_cell"))
+    if old_cell is not None or new_cell is not None:
+        if old_cell is None or new_cell is None:
+            raise InvalidCorrection("name both the old and the new cell id")
+        return {str(old_cell): str(new_cell), str(new_cell): str(old_cell)}
+
+    # A bare body of {"old": "new"} pairs is accepted as an explicit map when
+    # no other field carries cell ids.
+    bare = {
+        str(key): str(value)
+        for key, value in body.items()
+        if key not in _METADATA_KEYS and isinstance(value, str)
+    }
+    if bare:
+        return bare
+
+    raise InvalidCorrection(
+        "a correction must name cell ids to permute: provide permutation, "
+        "swaps or an ordered cells list"
+    )
+
+
+async def _correction_request(
+    request: Request,
+    period: Optional[str],
+    archive: Archive,
+) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="request body must be JSON") from exc
+    if not isinstance(body, Mapping):
+        raise HTTPException(status_code=422, detail="request body must be an object")
+
+    body_period = _first(body, _PERIOD_KEYS)
+    query_period = _first(request.query_params, _PERIOD_KEYS)
+    period = (
+        period
+        or (str(body_period) if body_period is not None else None)
+        or (str(query_period) if query_period is not None else None)
+    )
+    if not period or not str(period).strip():
+        raise HTTPException(
+            status_code=422, detail="statistical period must not be blank"
+        )
+    seen = _first(body, _SEEN_BATCH_KEYS)
+    if seen is None:
+        seen = _first(request.query_params, _SEEN_BATCH_KEYS)
+    if not isinstance(seen, str) or not seen:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "seen_batch_id is required and must be the batch id currently "
+                "reported by GET /archive/{period}"
+            ),
+        )
+
+    try:
+        permutation = validate_permutation(_correction_permutation(body))
+    except InvalidCorrection as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    try:
+        result = archive.correct_batch(period, seen, permutation)
+    except UnknownPeriod as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except BatchChanged as exc:
+        return JSONResponse(
+            status_code=409,
+            content=CorrectionFailureResponse(
+                detail=(
+                    "the archive changed after the seen batch; correction "
+                    "refused and the current batch is unchanged"
+                ),
+                period=period,
+                seen_batch_id=exc.expected,
+                current_batch_id=exc.current,
+            ).model_dump(),
+        )
+    except CorrectionProblem as exc:
+        return JSONResponse(
+            status_code=422,
+            content=CorrectionFailureResponse(
+                detail=str(exc),
+                period=period,
+                seen_batch_id=seen,
+                current_batch_id=seen,
+                upper_cells=list(exc.upper_cells),
+                missing_cells=list(exc.missing_cells),
+                negative_cells=list(exc.negative_cells),
+                missing_regions=list(exc.missing_regions),
+            ).model_dump(),
+        )
+    except InvalidCorrection as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except InvalidBatch as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return JSONResponse(
+        status_code=201,
+        content={
+            "period": result.period,
+            "batch_id": result.batch_id,
+            "new_batch_id": result.batch_id,
+            "batch_no": result.batch_id,
+            "previous_batch_id": result.seen_batch_id,
+            "old_batch_id": result.seen_batch_id,
+            "seen_batch_id": result.seen_batch_id,
+            "created_at": result.created_at,
+            "cell_count": result.cell_count,
+            "total_population": result.total_population,
+            "total": result.total_population,
+            "permutation": dict(result.permutation),
+            "corrections": [
+                {
+                    "source": source,
+                    "target": target,
+                    "old": source,
+                    "new": target,
+                }
+                for source, target in result.permutation
+            ],
+            "moves": [
+                {
+                    "source": source,
+                    "target": target,
+                    "old_cell": source,
+                    "new_cell": target,
+                    "from_cell": source,
+                    "to_cell": target,
+                    "cell": source,
+                    "population": population,
+                }
+                for source, target, population in result.moves
+            ],
+            "recomputed": [
+                {
+                    "cell": cell,
+                    "previous_population": previous,
+                    "population": population,
+                    "old_population": previous,
+                    "new_population": population,
+                }
+                for cell, previous, population in result.recomputed
+            ],
+            "upper_cells": [
+                cell for cell, _, _ in result.recomputed
+            ],
+        },
+    )
+
+
+@app.post("/archive/{period}/correct")
+async def correct_cells_in_period(
+    period: str,
+    request: Request,
+    archive: Archive = Depends(get_archive),
+) -> JSONResponse:
+    return await _correction_request(request, period, archive)
+
+
+@app.post("/archive/{period}/correction")
+async def correct_cells_in_period_alias(
+    period: str,
+    request: Request,
+    archive: Archive = Depends(get_archive),
+) -> JSONResponse:
+    return await _correction_request(request, period, archive)
+
+
+@app.post("/archive/{period}/corrections")
+async def correct_cells_in_period_plural(
+    period: str,
+    request: Request,
+    archive: Archive = Depends(get_archive),
+) -> JSONResponse:
+    return await _correction_request(request, period, archive)
+
+
+@app.post("/archive/{period}/swap")
+async def swap_cells_in_period(
+    period: str,
+    request: Request,
+    archive: Archive = Depends(get_archive),
+) -> JSONResponse:
+    return await _correction_request(request, period, archive)
+
+
+@app.post("/archive/{period}/cells/correct")
+async def correct_cells_nested(
+    period: str,
+    request: Request,
+    archive: Archive = Depends(get_archive),
+) -> JSONResponse:
+    return await _correction_request(request, period, archive)
+
+
+@app.post("/correction")
+async def correct_cells(
+    request: Request,
+    archive: Archive = Depends(get_archive),
+) -> JSONResponse:
+    return await _correction_request(request, None, archive)
+
+
+@app.post("/census/correct")
+async def correct_cells_census_alias(
+    request: Request,
+    archive: Archive = Depends(get_archive),
+) -> JSONResponse:
+    return await _correction_request(request, None, archive)
+
+
+@app.post("/census/correction")
+async def correct_cells_census_correction_alias(
+    request: Request,
+    archive: Archive = Depends(get_archive),
+) -> JSONResponse:
+    return await _correction_request(request, None, archive)
+
+
+@app.put("/archive/{period}/correct")
+async def correct_cells_in_period_put(
+    period: str,
+    request: Request,
+    archive: Archive = Depends(get_archive),
+) -> JSONResponse:
+    return await _correction_request(request, period, archive)
+
+
+@app.put("/archive/{period}/correction")
+async def correct_cells_in_period_put_alias(
+    period: str,
+    request: Request,
+    archive: Archive = Depends(get_archive),
+) -> JSONResponse:
+    return await _correction_request(request, period, archive)
+
+
+@app.put("/correction")
+async def correct_cells_put(
+    request: Request,
+    archive: Archive = Depends(get_archive),
+) -> JSONResponse:
+    return await _correction_request(request, None, archive)
 
 
 @app.post("/census/query", response_model=CensusResponse)

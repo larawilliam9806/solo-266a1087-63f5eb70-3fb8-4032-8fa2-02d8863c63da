@@ -11,6 +11,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
+# The /data volume may be mounted by the runtime; the service creates the
+# database (and upgrades pre-existing archives) on first use.
 RUN mkdir -p /data && chown -R 1000:1000 /data
 VOLUME ["/data"]
 EXPOSE 8000
